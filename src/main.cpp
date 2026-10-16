@@ -1,21 +1,21 @@
 // NUCLEO-L152RE + 16x2 HD44780 LCD (PCF8574 I2C backpack, address 0x27)
-// Clock / stopwatch / countdown timer with 5 buttons. Uses only Arduino.h.
+// Uhr, Stoppuhr, Countdown-Timer + Parierbares Lade-Lauflicht (via PB0)
 //
-// Buttons (wired between the pin and GND, internal pull-up):
-//   PB0  -> clock mode
-//   PB3  -> stopwatch: enter mode and start (also resumes after a stop)
-//   PB4  -> stopwatch: stop (press again while stopped = reset to 0)
-//   PA6  -> countdown timer: enter / next field (hour -> minute -> start)
-//   PA10 -> countdown timer: +1 on the selected field (hold to repeat)
+// Tasten (mit INPUT_PULLDOWN, schalten nach HIGH):
+//   PB0  -> Uhr-Modus (Wechsel zur Uhr & pausiert das Lauflicht)
+//   PB3  -> Stoppuhr Start / Resume (lässt Lauflicht weiterlaufen)
+//   PB4  -> Stoppuhr Stop / Reset
+//   PA6  -> Countdown Timer Modus / Nächstes Feld (lässt Lauflicht weiterlaufen)
+//   PA10 -> Countdown Timer +1 (gedrückt halten zum Wiederholen)
 //
-// LCD wiring: SDA = D14 (PB9), SCL = D15 (PB8)
+// LCD-Verkabelung: SDA = D14 (PB9), SCL = D15 (PB8)
 
 #include <Arduino.h>
 
-// ---------- Settings ----------
-#define SDA_PIN   D14
-#define SCL_PIN   D15
-#define LCD_ADDR  0x27
+// ---------- Einstellungen ----------
+#define SDA_PIN     D14
+#define SCL_PIN     D15
+#define LCD_ADDR    0x27
 
 #define BTN_CLOCK     PB0
 #define BTN_SW_START  PB3
@@ -23,9 +23,7 @@
 #define BTN_TMR_MODE  PA6
 #define BTN_TMR_SET   PA10
 
-// 1 = button connects the pin to GND (pull-up used)
-// 0 = button/touch module drives the pin HIGH (pull-down used)
-#define ACTIVE_LOW    1
+#define ACTIVE_LOW    0
 #define DEBOUNCE_MS   30
 
 #define BIT_RS 0x01
@@ -33,13 +31,21 @@
 #define BIT_E  0x04
 #define BIT_BL 0x08
 
-// ---------- Software I2C (open-drain emulation) ----------
+// ---------- Software I2C ----------
 #define I2C_US 5
 
 static inline void sdaHigh() { pinMode(SDA_PIN, INPUT_PULLUP); }
 static inline void sdaLow()  { digitalWrite(SDA_PIN, LOW); pinMode(SDA_PIN, OUTPUT); }
 static inline void sclHigh() { pinMode(SCL_PIN, INPUT_PULLUP); }
 static inline void sclLow()  { digitalWrite(SCL_PIN, LOW); pinMode(SCL_PIN, OUTPUT); }
+
+#define LED_PORTC GPIOC
+#define LED_PORTB GPIOB
+#define LED_PORTA GPIOA
+
+int chargeStep = 0; // 0 bis 48 (Füllstand für Port C, B und A)
+uint32_t lastLedUpdate = 0;
+bool ledPaused = false; // Steuert, ob das Lauflicht pausiert ist
 
 static void i2cStart() {
   sdaHigh(); sclHigh(); delayMicroseconds(I2C_US);
@@ -61,7 +67,7 @@ static bool i2cWrite(uint8_t b) {
     sclLow();
     b <<= 1;
   }
-  sdaHigh();                                   // release for ACK
+  sdaHigh();                          // ACK freigeben
   delayMicroseconds(I2C_US);
   sclHigh(); delayMicroseconds(I2C_US);
   bool ack = (digitalRead(SDA_PIN) == LOW);
@@ -76,8 +82,8 @@ static void pcfWrite(uint8_t v) {
   i2cStop();
 }
 
-// ---------- HD44780 over PCF8574 (4-bit mode) ----------
-static uint8_t blBit = BIT_BL;                 // backlight bit (0 = off)
+// ---------- HD44780 über PCF8574 (4-Bit Modus) ----------
+static uint8_t blBit = BIT_BL;              // Hintergrundbeleuchtung
 
 static void lcdWrite4(uint8_t nibble, uint8_t rs) {
   uint8_t d = (nibble << 4) | rs | blBit;
@@ -93,7 +99,7 @@ static void lcdSend(uint8_t v, uint8_t rs) {
 
 static void lcdCmd(uint8_t c) {
   lcdSend(c, 0);
-  if (c <= 0x03) delay(2);                     // clear / home are slow
+  if (c <= 0x03) delay(2);
 }
 
 static void lcdInit() {
@@ -101,11 +107,11 @@ static void lcdInit() {
   lcdWrite4(0x03, 0); delay(5);
   lcdWrite4(0x03, 0); delay(1);
   lcdWrite4(0x03, 0); delay(1);
-  lcdWrite4(0x02, 0);                          // switch to 4-bit mode
-  lcdCmd(0x28);                                // 4-bit, 2 lines, 5x8 font
-  lcdCmd(0x0C);                                // display on, cursor off
-  lcdCmd(0x01);                                // clear
-  lcdCmd(0x06);                                // entry mode: increment
+  lcdWrite4(0x02, 0);                          // 4-Bit Modus
+  lcdCmd(0x28);                                // 4-Bit, 2 Zeilen, 5x8 Font
+  lcdCmd(0x0C);                                // Display an, Cursor aus
+  lcdCmd(0x01);                                // Löschen
+  lcdCmd(0x06);                                // Increment
 }
 
 static void lcdSetCursor(uint8_t col, uint8_t row) {
@@ -121,7 +127,6 @@ static void setBacklight(bool on) {
   pcfWrite(blBit);
 }
 
-// Writes a full 16-char line, only if its content changed (no flicker)
 static char shown[2][17];
 
 static void lcdLine(uint8_t row, const char *txt) {
@@ -130,14 +135,14 @@ static void lcdLine(uint8_t row, const char *txt) {
   if (n > 16) n = 16;
   memset(buf, ' ', 16);
   buf[16] = 0;
-  memcpy(buf + (16 - n) / 2, txt, n);          // centered
+  memcpy(buf + (16 - n) / 2, txt, n);          // Zentriert
   if (memcmp(buf, shown[row], 17) == 0) return;
   memcpy(shown[row], buf, 17);
   lcdSetCursor(0, row);
   lcdPrint(buf);
 }
 
-// ---------- Calendar / clock ----------
+// ---------- Uhrzeit / Kalender ----------
 static const char *DAYS[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
 static bool isLeap(uint16_t y) {
@@ -149,7 +154,7 @@ static uint8_t daysInMonth(uint8_t m, uint16_t y) {
   return (m == 2 && isLeap(y)) ? 29 : dm[m - 1];
 }
 
-static uint8_t weekday(uint16_t y, uint8_t m, uint8_t d) {   // 0 = Sunday
+static uint8_t weekday(uint16_t y, uint8_t m, uint8_t d) {   // 0 = Sonntag
   static const uint8_t t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
   if (m < 3) y -= 1;
   return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
@@ -158,7 +163,6 @@ static uint8_t weekday(uint16_t y, uint8_t m, uint8_t d) {   // 0 = Sunday
 uint8_t  hh, mm, ss, day, month;
 uint16_t year;
 
-// Start from the PC time at compile time (or assign the values yourself)
 static void loadCompileTime() {
   const char *date = __DATE__;                 // "Oct 16 2026"
   const char *time = __TIME__;                 // "12:34:56"
@@ -185,7 +189,7 @@ static void clockTick() {
   }
 }
 
-// ---------- Buttons ----------
+// ---------- Tasten-Entprellung ----------
 struct Button {
   uint32_t pin;
   bool     raw, state;
@@ -199,11 +203,10 @@ static bool readPressed(uint32_t pin) {
 static void initButton(Button &b, uint32_t pin) {
   pinMode(pin, ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
   b.pin = pin;
-  b.raw = b.state = readPressed(pin);          // avoids a fake press at boot
+  b.raw = b.state = readPressed(pin);
   b.changedAt = b.pressedAt = b.repeatAt = millis();
 }
 
-// Returns true once per press (and repeatedly while held, if repeat is set)
 static bool pollButton(Button &b, bool repeat) {
   uint32_t now = millis();
   bool r = readPressed(b.pin);
@@ -221,7 +224,7 @@ static bool pollButton(Button &b, bool repeat) {
 
 Button btnClock, btnSwStart, btnSwStop, btnTmrMode, btnTmrSet;
 
-// ---------- Modes ----------
+// ---------- Modi ----------
 enum Mode {
   MODE_CLOCK,
   MODE_STOPWATCH,
@@ -233,35 +236,38 @@ enum Mode {
 
 Mode mode = MODE_CLOCK;
 
-// Stopwatch
+// Stoppuhr Variablen
 bool     swRunning = false;
 uint32_t swStart = 0, swElapsed = 0;
 
-// Countdown timer
+// Countdown Timer Variablen
 uint8_t  tH = 0, tM = 0;
 uint32_t timerEnd = 0;
 
 static void handleButtons() {
-  bool bClock  = pollButton(btnClock,   false);
-  bool bSwGo   = pollButton(btnSwStart, false);
-  bool bSwStop = pollButton(btnSwStop,  false);
-  bool bTmr    = pollButton(btnTmrMode, false);
-  bool bSet    = pollButton(btnTmrSet,  true);
+  bool bClock  = pollButton(btnClock,    false);
+  bool bSwGo   = pollButton(btnSwStart,  false);
+  bool bSwStop = pollButton(btnSwStop,   false);
+  bool bTmr    = pollButton(btnTmrMode,  false);
+  bool bSet    = pollButton(btnTmrSet,   true);
 
-  // Alarm is showing: any button dismisses it
+  // Alarm aktiv: Beliebige Taste bricht ihn ab
   if (mode == MODE_TIMER_DONE) {
     if (bClock || bSwGo || bSwStop || bTmr || bSet) {
       digitalWrite(LED_BUILTIN, LOW);
       setBacklight(true);
       mode = MODE_CLOCK;
+      ledPaused = false; // Lauflicht wieder fortsetzen
     }
     return;
   }
 
-  if (bClock) {                                // -> clock (cancels stopwatch/timer)
+  if (bClock) {                            // Zurück zur Uhrzeit -> Lauflicht pausieren
     swRunning = false;
     mode = MODE_CLOCK;
-  } else if (bSwGo) {                          // -> stopwatch start / resume
+    ledPaused = true;
+  } else if (bSwGo) {                      // Stoppuhr Start / Resume -> Lauflicht läuft weiter
+    ledPaused = false;
     if (mode != MODE_STOPWATCH) {
       mode = MODE_STOPWATCH;
       swElapsed = 0;
@@ -271,7 +277,7 @@ static void handleButtons() {
       swRunning = true;
       swStart = millis();
     }
-  } else if (bSwStop) {                        // stopwatch stop / reset
+  } else if (bSwStop) {                    // Stoppuhr Stop / Reset
     if (mode == MODE_STOPWATCH) {
       if (swRunning) {
         swElapsed += millis() - swStart;
@@ -280,11 +286,12 @@ static void handleButtons() {
         swElapsed = 0;
       }
     }
-  } else if (bTmr) {                           // timer: next step
+  } else if (bTmr) {                       // Timer-Schritte durchschalten -> Lauflicht läuft weiter
+    ledPaused = false;
     switch (mode) {
       case MODE_CLOCK:
       case MODE_STOPWATCH:
-      case MODE_TIMER_RUN:                     // restart the setting process
+      case MODE_TIMER_RUN:
         swRunning = false;
         tH = tM = 0;
         mode = MODE_TIMER_SET_H;
@@ -293,8 +300,9 @@ static void handleButtons() {
         mode = MODE_TIMER_SET_M;
         break;
       case MODE_TIMER_SET_M:
-        if (tH == 0 && tM == 0) {              // nothing entered -> cancel
+        if (tH == 0 && tM == 0) {
           mode = MODE_CLOCK;
+          ledPaused = true; // Falls leer, zurück zur pausierten Uhr
         } else {
           timerEnd = millis() + (tH * 3600UL + tM * 60UL) * 1000UL;
           mode = MODE_TIMER_RUN;
@@ -303,7 +311,7 @@ static void handleButtons() {
       default:
         break;
     }
-  } else if (bSet) {                           // timer: +1 on selected field
+  } else if (bSet) {                       // Wert erhöhen (+1 auf PA10)
     if (mode == MODE_TIMER_SET_H)      tH = (tH + 1) % 24;
     else if (mode == MODE_TIMER_SET_M) tM = (tM + 1) % 60;
   }
@@ -344,7 +352,7 @@ static void render() {
 
     case MODE_TIMER_RUN: {
       int32_t rem = (int32_t)(timerEnd - millis());
-      if (rem <= 0) {                          // finished
+      if (rem <= 0) {
         mode = MODE_TIMER_DONE;
         return;
       }
@@ -361,7 +369,6 @@ static void render() {
     default: {
       strcpy(a, "TIME'S UP!");
       strcpy(b, "Press any button");
-      // flash backlight and the on-board LED
       static bool lastOn = true;
       bool on = ((millis() / 500) % 2) == 0;
       if (on != lastOn) {
@@ -378,9 +385,29 @@ static void render() {
 }
 
 void setup() {
+  // Takte für Ports C, B und A aktivieren
+  RCC->AHBENR |= (1<<2);
+  RCC->AHBENR |= (1<<1);
+  RCC->AHBENR |= (1<<0);
+
+  // Ports C und B komplett als Output konfigurieren
+  LED_PORTC->MODER &= ~0xFFFFFFFF; 
+  LED_PORTC->MODER |= 0x55555555; 
+  LED_PORTB->MODER &= ~0xFFFFFFFF; 
+  LED_PORTB->MODER |= 0x55555555; 
+
+  // Port A als Output konfigurieren
+  LED_PORTA->MODER &= ~0xFFFFFFFF; 
+  LED_PORTA->MODER |= 0x55555555; 
+
+  LED_PORTC->ODR = 0x00000000; 
+  LED_PORTB->ODR = 0x00000000; 
+  LED_PORTA->ODR = 0x00000000; 
+  
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
+  // Tasten mit INPUT_PULLDOWN initialisieren
   initButton(btnClock,   BTN_CLOCK);
   initButton(btnSwStart, BTN_SW_START);
   initButton(btnSwStop,  BTN_SW_STOP);
@@ -395,14 +422,43 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastTick = millis();
+  // 1. Non-Blocking Lade-Lauflicht (läuft nur, wenn nicht pausiert)
+  uint32_t now = millis();
+  if (!ledPaused && (now - lastLedUpdate >= 50)) {
+    lastLedUpdate = now;
 
-  // The clock keeps running in the background in every mode
+    if (chargeStep <= 16) {
+      LED_PORTC->ODR = (chargeStep == 0) ? 0 : ((1UL << chargeStep) - 1);
+      LED_PORTB->ODR = 0;
+      LED_PORTA->ODR = 0;
+    } else if (chargeStep <= 32) {
+      LED_PORTC->ODR = 0xFFFF;
+      int bSteps = chargeStep - 16;
+      LED_PORTB->ODR = (bSteps == 0) ? 0 : ((1UL << bSteps) - 1);
+      LED_PORTA->ODR = 0;
+    } else {
+      LED_PORTC->ODR = 0xFFFF;
+      LED_PORTB->ODR = 0xFFFF;
+      int aSteps = chargeStep - 32;
+      uint32_t aVal = (aSteps == 0) ? 0 : ((1UL << aSteps) - 1);
+      aVal &= ~((1UL << 6) | (1UL << 10)); // Tasten-Pins schützen
+      LED_PORTA->ODR = aVal;
+    }
+
+    chargeStep++;
+    if (chargeStep > 48) {
+      chargeStep = 0; 
+    }
+  }
+
+  // 2. Hintergrund-Uhrsekunden zählen
+  static uint32_t lastTick = millis();
   while (millis() - lastTick >= 1000) {
     lastTick += 1000;
     clockTick();
   }
 
+  // 3. Tasten und Display aktualisieren
   handleButtons();
   render();
 }
